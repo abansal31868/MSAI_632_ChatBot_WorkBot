@@ -44,7 +44,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install required packages
 pip install --upgrade pip
-pip install langchain langchain-community langchain-huggingface faiss-cpu sentence-transformers transformers accelerate torch streamlit google-api-python-client google-auth-httplib2 google-auth-oauthlib "langchain-google-community[drive]" fastapi uvicorn pypdf langchain-classic
+pip install langchain langchain-community langchain-huggingface faiss-cpu sentence-transformers transformers accelerate torch streamlit google-api-python-client google-auth-httplib2 google-auth-oauthlib "langchain-google-community[drive]" fastapi uvicorn pypdf langchain-classic dateparser
 🔑 Configuration
 Step 1: Google Cloud Service Account
 Go to Google Cloud Console > IAM & Admin > Service Accounts.

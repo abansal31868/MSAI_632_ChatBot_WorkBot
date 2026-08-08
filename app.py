@@ -6,6 +6,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEmbeddings, HuggingFaceEndpoint
 import streamlit as st
 
+from router import route_task
+
 st.set_page_config(page_title="Workplace Copilot", page_icon="🤖")
 st.title("💼 Workplace Knowledge Assistant")
 
@@ -50,10 +52,10 @@ def load_rag_chain():
     )
 
     qa_chain = create_stuff_documents_chain(llm, prompt)
-    return create_retrieval_chain(retriever, qa_chain)
+    return create_retrieval_chain(retriever, qa_chain), llm
 
 
-rag_chain = load_rag_chain()
+rag_chain, chat_llm = load_rag_chain()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -68,8 +70,16 @@ if user_input := st.chat_input("Ask about company policies or processes..."):
         st.markdown(user_input)
 
     with st.chat_message("assistant"):
-        response = rag_chain.invoke({"input": user_input})
-        st.markdown(response["answer"])
-        st.session_state.messages.append(
-            {"role": "assistant", "content": response["answer"]}
-        )
+        # Check for a task-automation intent (to-do, calendar event, email
+        # draft) before falling through to the RAG chain. This is a plain
+        # function call, not a model call, so it doesn't touch the free
+        # Inference Providers quota.
+        task_result = route_task(user_input, llm=chat_llm)
+        if task_result is not None:
+            answer = task_result
+        else:
+            response = rag_chain.invoke({"input": user_input})
+            answer = response["answer"]
+
+        st.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
