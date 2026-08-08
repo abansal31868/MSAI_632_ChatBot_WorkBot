@@ -23,17 +23,6 @@ An enterprise workplace productivity assistant built with **LangChain**, **Huggi
 ├── faiss_workplace_index/ # Generated local FAISS vector index database
 └── requirements.txt       # Project dependencies
 
-git clone [https://github.com/your-username/workplace-rag-copilot.git](https://github.com/your-username/workplace-rag-copilot.git)
-cd workplace-rag-copilot
-
-# Create and activate virtual environment (optional)
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install required packages
-pip install --upgrade pip
-pip install langchain langchain-community langchain-huggingface faiss-cpu sentence-transformers transformers accelerate torch streamlit google-api-python-client google-auth-httplib2 google-auth-oauthlib "langchain-google-community[drive]" fastapi uvicorn
-
 🛠️ Prerequisites & Setup
 1. Requirements
 macOS / Linux / Windows with Python 3.10 – 3.12 installed.
@@ -55,7 +44,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install required packages
 pip install --upgrade pip
-pip install langchain langchain-community langchain-huggingface faiss-cpu sentence-transformers transformers accelerate torch streamlit google-api-python-client google-auth-httplib2 google-auth-oauthlib "langchain-google-community[drive]" fastapi uvicorn
+pip install langchain langchain-community langchain-huggingface faiss-cpu sentence-transformers transformers accelerate torch streamlit google-api-python-client google-auth-httplib2 google-auth-oauthlib "langchain-google-community[drive]" fastapi uvicorn pypdf 
 🔑 Configuration
 Step 1: Google Cloud Service Account
 Go to Google Cloud Console > IAM & Admin > Service Accounts.
@@ -68,6 +57,11 @@ Locate the client_email inside credentials.json and share your target Google Dri
 
 Step 2: Environment Variables
 Export your Hugging Face API Token in your terminal or set it in your scripts:
+
+Step 3: Ensure the Google Drive API is Enabled
+- Open the Google Cloud Console API Library.
+- Ensure your project (project-msai-rag-drive-reader or equivalent) is selected at the top.
+- Search for Google Drive API and click Enable.
 
 Bash
 export HUGGINGFACEHUB_API_TOKEN="your_hf_token_here"
