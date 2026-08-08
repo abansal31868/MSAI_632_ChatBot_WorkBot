@@ -59,6 +59,8 @@ rag_chain, chat_llm = load_rag_chain()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "pending_task" not in st.session_state:
+    st.session_state.pending_task = None
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -73,8 +75,13 @@ if user_input := st.chat_input("Ask about company policies or processes..."):
         # Check for a task-automation intent (to-do, calendar event, email
         # draft) before falling through to the RAG chain. This is a plain
         # function call, not a model call, so it doesn't touch the free
-        # Inference Providers quota.
-        task_result = route_task(user_input, llm=chat_llm)
+        # Inference Providers quota. pending_task carries an in-progress
+        # calendar request across turns (e.g. still waiting on a date/time)
+        # so follow-up messages get merged into it instead of being treated
+        # as brand-new, context-free requests.
+        task_result, st.session_state.pending_task = route_task(
+            user_input, llm=chat_llm, pending_task=st.session_state.pending_task
+        )
         if task_result is not None:
             answer = task_result
         else:
