@@ -9,6 +9,9 @@ An enterprise workplace productivity assistant built with **LangChain**, **Huggi
 1. **Ingestion (`ingest.py`)**: Fetches documents from a Google Drive folder, splits them into semantic chunks, generates embeddings using `sentence-transformers/all-MiniLM-L6-v2`, and builds a local FAISS vector store.
 2. **Real-time Synchronization (`webhook_server.py` & `register_webhook.py`)**: Subscribes to Google Drive push notifications to automatically update the vector index whenever documents are added or updated.
 3. **Chat Interface (`app.py`)**: Streamlit web interface powered by Hugging Face Inference API (`meta-llama/Llama-3.1-8B-Instruct`, via `ChatHuggingFace`) for answering workplace queries.
+4. **Personalization (`personalization.py`)**: A sidebar form (name, department, preferred answer style) saved locally in SQLite and folded into the system prompt on every turn -- no extra model calls.
+5. **Memory Management (`memory.py`)**: Short-term memory replays the last few turns into the model's context via a `chat_history` placeholder; long-term memory persists facts across sessions when the user explicitly says "remember that ...".
+6. **Multilingual Support (`i18n.py`)**: Detects the incoming message's language (`langdetect`) and translates to/from English (`deep-translator`, via Google Translate's free endpoint) around the English-only RAG/router core.
 
 ---
 
@@ -19,9 +22,15 @@ An enterprise workplace productivity assistant built with **LangChain**, **Huggi
 ├── ingest.py              # Google Drive ingestion & vector store builder
 ├── webhook_server.py      # FastAPI server to listen for Drive update events
 ├── register_webhook.py    # Script to register webhook channel with Google Drive
-├── credentials.json       # Google Cloud Service Account credentials (DO NOT COMMIT)
-├── faiss_workplace_index/ # Generated local FAISS vector index database
-└── requirements.txt       # Project dependencies
+├── router.py               # Deterministic intent router (task automation + remember)
+├── tools.py                 # Local, free task-automation tools (to-do, calendar, email draft)
+├── memory.py                # Short-term + long-term conversation memory (Feature #6)
+├── personalization.py       # Local user-profile personalization (Feature #5)
+├── i18n.py                  # Language detection + translation (Feature #15)
+├── credentials.json        # Google Cloud Service Account credentials (DO NOT COMMIT)
+├── faiss_workplace_index/  # Generated local FAISS vector index database
+├── workbot_data.db         # Local SQLite store (to-dos, long-term facts, profile)
+└── requirements.txt         # Project dependencies
 
 🛠️ Prerequisites & Setup
 1. Requirements
@@ -44,7 +53,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install required packages
 pip install --upgrade pip
-pip install langchain langchain-community langchain-huggingface faiss-cpu sentence-transformers transformers accelerate torch streamlit google-api-python-client google-auth-httplib2 google-auth-oauthlib "langchain-google-community[drive]" fastapi uvicorn pypdf langchain-classic dateparser
+pip install langchain langchain-community langchain-huggingface faiss-cpu sentence-transformers transformers accelerate torch streamlit google-api-python-client google-auth-httplib2 google-auth-oauthlib "langchain-google-community[drive]" fastapi uvicorn pypdf langchain-classic dateparser langdetect deep-translator
 🔑 Configuration
 Step 1: Google Cloud Service Account
 Go to Google Cloud Console > IAM & Admin > Service Accounts.
@@ -98,7 +107,21 @@ Update WEBHOOK_URL in register_webhook.py with your public HTTPS endpoint and ru
 Bash
 python register_webhook.py
 
+## 🧩 Using Personalization, Memory, and Multilingual Support
+
+- **Personalization**: open the sidebar, fill in your name/department/preferred answer style, and click Save. It applies starting with your next message.
+- **Long-term memory**: say something like *"remember that I work on the Q3 migration project"*. WorkBot will recall it in the system prompt on every later turn, in this and future sessions, until you clear `workbot_data.db`.
+- **Short-term memory**: no action needed -- the last few turns are automatically replayed into context so follow-up questions ("what about the 2024 version?") work without repeating yourself.
+- **Multilingual support**: just type in another language. WorkBot detects it, answers using the same English-only document index and router, and translates the reply back automatically. If Google Translate's free endpoint is unreachable or rate-limited, WorkBot falls back to answering in English rather than failing.
+
 🩹 Troubleshooting
+
+**Translation looks wrong or isn't happening**
+`i18n.py` uses `deep-translator`'s `GoogleTranslator`, which calls Google Translate's free web endpoint (no API key). It can rate-limit under heavy use; on any error it fails open and returns the original text, so a translation hiccup degrades to an English-only reply rather than crashing the chat. If this happens often in a demo, test the specific language pair with a short standalone script before relying on it live.
+
+**A short message got treated as English when it wasn't**
+`langdetect` is unreliable on very short strings, so anything under 12 characters is assumed English by design (see `i18n.MIN_CHARS_FOR_DETECTION`) rather than risking a wrong-language guess on something like "ok" or "sí". Longer messages detect correctly.
+
 
 **`ValueError: Model ... is not supported for task text-generation and provider ...`**
 Some models on Hugging Face's Inference Providers routing are only served via the *conversational* (chat) endpoint, not raw text-generation. `app.py` already handles this by wrapping the LLM in `ChatHuggingFace` rather than calling `HuggingFaceEndpoint` directly — if you're extending `app.py` and hit this error on a new model, wrap it the same way:

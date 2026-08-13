@@ -1,6 +1,7 @@
 """
 Deterministic intent router for WorkBot's Task Automation / API & Tool
-Integration features.
+Integration features, plus the explicit "remember that ..." trigger for
+long-term memory (Feature #6, see memory.py).
 
 Why deterministic instead of LLM tool-calling: see test_tool_calling.py and
 the README. Short version: measured ~56% tool-selection accuracy on the
@@ -27,6 +28,7 @@ being evaluated as brand-new, context-free messages.
 import re
 
 from calendar_integration import try_create_google_calendar_event
+from memory import remember_fact
 from tools import create_calendar_event, draft_email, log_todo
 
 try:
@@ -148,6 +150,20 @@ _TODO_PATTERNS = [
     re.compile(r"(?:log|create) (?:a )?(?:to-?do|task)(?: to| for)?\s+(.+)", re.IGNORECASE),
 ]
 
+# Long-term memory (Feature #6): only fires on an explicit "remember
+# that ..." / "please remember ..." request, never inferred from ordinary
+# conversation -- see memory.py's docstring for why. Deliberately a
+# different trigger word ("remember") from the to-do patterns above
+# ("remind me to"), though "please remember to submit the report" will
+# still match this block rather than _TODO_PATTERNS, storing "to submit
+# the report" as a fact rather than a to-do item. That's a known rough
+# edge in the phrasing overlap between "remember" and "remind", not a bug
+# -- either intent produces a reasonable, visible result for the user.
+_REMEMBER_PATTERNS = [
+    re.compile(r"remember that (.+)", re.IGNORECASE),
+    re.compile(r"please remember (.+)", re.IGNORECASE),
+]
+
 # Calendar trigger verbs need to be followed by an explicit calendar-ish
 # noun (invite/meeting/event/etc.) -- otherwise generic verbs like "create"
 # or "make" would hijack unrelated requests ("create a summary of...").
@@ -177,6 +193,8 @@ def _looks_like_new_intent(text: str) -> bool:
     fully-formed request, used to decide whether to abandon a pending
     calendar task rather than treat this message as continuing it."""
     if any(p.search(text) for p in _TODO_PATTERNS):
+        return True
+    if any(p.search(text) for p in _REMEMBER_PATTERNS):
         return True
     if _EMAIL_PATTERN_WITH_RECIPIENT.search(text) or _EMAIL_PATTERN_NO_RECIPIENT.search(text):
         return True
@@ -234,6 +252,13 @@ def route_task(
             return _continue_pending_calendar(text, pending_task)
         # else: message looks like a fresh, complete request of its own --
         # fall through and abandon the pending one.
+
+    # --- Remember (long-term memory, Feature #6) ---
+    for pattern in _REMEMBER_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            fact = match.group(1).strip(" ?.!")
+            return remember_fact(fact), None
 
     # --- To-do ---
     # We deliberately do NOT try to strip the date phrase out of the task
