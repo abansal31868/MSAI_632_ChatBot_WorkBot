@@ -1,4 +1,6 @@
 credentials.json
+oauth_credentials.json
+calendar_token.json
 faiss_workplace_index
 temp_pdfs
 __pycache__
@@ -6,3 +8,5 @@ email_drafts/
 workbot_data.db
 workbot_calendar.ics
 venv/
+
+temp_docs

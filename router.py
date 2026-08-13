@@ -15,21 +15,24 @@ known intent, extract its parameters, call the matching function in
 tools.py. If nothing matches, route_task returns None and app.py falls
 through to the normal RAG chain.
 
-Multi-turn calendar slot-filling: a calendar request only has one hard
-requirement to actually create an event -- a real date/time. If that's
-missing, route_task asks for it and returns a "pending_task" dict instead
-of executing immediately. The caller (app.py) is responsible for storing
-that dict in session state and passing it back in on the *next* call, so
-follow-up messages ("it's at 2pm", "with Alpna and Tim", "it's about
-budget planning") get merged into the same in-progress request instead of
-being evaluated as brand-new, context-free messages.
+Multi-turn slot-filling: a calendar request only has one hard requirement
+to actually create an event -- a real date/time. An email request's hard
+requirement is a topic (a recipient can fall back to a "[recipient]"
+placeholder, but there's nothing to write about with no topic at all). If
+either is missing, route_task asks for it and returns a "pending_task"
+dict instead of executing immediately. The caller (app.py) is responsible
+for storing that dict in session state and passing it back in on the
+*next* call, so follow-up messages ("it's at 2pm", "with Alpna and Tim",
+"inviting him to the design meeting today") get merged into the same
+in-progress request instead of being evaluated as brand-new, context-free
+messages.
 """
 
 import re
 
 from calendar_integration import try_create_google_calendar_event
 from memory import remember_fact
-from tools import create_calendar_event, draft_email, log_todo
+from tools import create_calendar_event, draft_email, log_todo, send_email
 
 try:
     from dateparser.search import search_dates
@@ -141,6 +144,67 @@ def _finalize_calendar_event(slots: dict) -> str:
     return create_calendar_event(title=title, when=when)
 
 
+# A recipient phrase runs from "to" up to whichever comes first: a known
+# topic-introducing word/phrase, or the end of the string. This deliberately
+# does NOT require "about"/"regarding" to immediately follow -- earlier
+# versions did, which meant natural phrasings like "send an email to
+# inimfon inviting him to the design meeting today" (no "about" at all)
+# silently failed to match anything and fell through to the RAG chain.
+_EMAIL_RECIPIENT_PATTERN = re.compile(
+    r"\bto\s+(.+?)(?=\s+\b(?:about|regarding|concerning|on|re:?|for|"
+    r"inviting|telling|informing|asking|letting|updating|reminding)\b|$)",
+    re.IGNORECASE,
+)
+
+# Once the recipient (if any) has been sliced off, whatever text remains is
+# the topic -- but it usually still starts with a connector word/phrase
+# ("about", "inviting him to", "letting her know that", ...) that reads
+# awkwardly if left in a subject line or email body, so strip it off.
+_EMAIL_LEADING_CONNECTORS = re.compile(
+    r"^(?:about|regarding|concerning|on|re:?|for|"
+    r"inviting\s+(?:him|her|them|us)?\s*(?:to)?|"
+    r"telling\s+(?:him|her|them|us)?\s*(?:that|about)?|"
+    r"informing\s+(?:him|her|them|us)?\s*(?:that|about)?|"
+    r"asking\s+(?:him|her|them|us)?\s*(?:to|about)?|"
+    r"letting\s+(?:him|her|them|us)?\s*know\s*(?:that|about)?|"
+    r"updating\s+(?:him|her|them|us)?\s*(?:on|about)?|"
+    r"reminding\s+(?:him|her|them|us)?\s*(?:to|about)?"
+    r")\s+",
+    re.IGNORECASE,
+)
+
+
+def _parse_email_request(remainder: str) -> tuple[str, str]:
+    """Pull (recipient, topic) out of the text following an email trigger
+    verb, e.g. 'to inimfon inviting him to the design meeting today' ->
+    ('inimfon', 'the design meeting today'). Either piece can come back
+    empty -- an empty recipient falls back to a placeholder, an empty
+    topic means route_task needs to ask for one before it can act."""
+    remainder = remainder.strip(" ?.!")
+    match = _EMAIL_RECIPIENT_PATTERN.search(remainder)
+    if match:
+        recipient = match.group(1).strip(" ,.")
+        rest = remainder[match.end():].strip(" ,.")
+    else:
+        recipient = ""
+        rest = remainder
+    topic = _EMAIL_LEADING_CONNECTORS.sub("", rest, count=1).strip(" ,.")
+    return recipient, topic
+
+
+def _run_email_tool(mode: str, recipient: str, topic: str, llm=None) -> str:
+    recipient_final = recipient or "[recipient]"
+    subject = topic if len(topic) < 60 else topic[:57] + "..."
+    tool = send_email if mode == "send" else draft_email
+    result = tool(recipient=recipient_final, subject=subject, key_points=topic, llm=llm)
+    if not recipient:
+        result += (
+            "\n\n_(No recipient was specified, so I used a placeholder -- "
+            "let me know who this should go to and I'll redo it.)_"
+        )
+    return result
+
+
 # --- Intent patterns -------------------------------------------------------
 # Order matters: more specific patterns should come before more general ones.
 
@@ -174,15 +238,24 @@ _CALENDAR_TRIGGER = re.compile(
     re.IGNORECASE,
 )
 
-_EMAIL_PATTERN_WITH_RECIPIENT = re.compile(
-    r"(?:draft|write|prepare|compose) (?:an |a )?email to (.+?)\s+"
-    r"(?:about|regarding|for|re:?)\s+(.+)",
-    re.IGNORECASE,
+# Both triggers just require the verb immediately before "email" -- the
+# recipient and topic are pulled out of whatever follows by
+# _parse_email_request, which handles far more natural phrasing than a
+# rigid "to X about Y" regex (e.g. "send an email to inimfon inviting him
+# to the design meeting today", with no "about" at all).
+#
+# "Send" is a deliberately separate intent from "draft" -- draft_email only
+# ever writes a local file, send_email actually attempts a real send (see
+# email_integration.py for why that's routed to a fixed demo address
+# rather than the parsed recipient). Deliberately NOT matching a bare
+# "email X about Y" phrasing (no send/fire off/draft/etc. verb) -- too easy
+# to false-positive on casual mentions of "email" as a noun (e.g. "check my
+# email for updates about the project").
+_EMAIL_DRAFT_TRIGGER = re.compile(
+    r"\b(?:draft|write|prepare|compose)\b\s+(?:an |a )?email\b\s*(.*)", re.IGNORECASE
 )
-_EMAIL_PATTERN_NO_RECIPIENT = re.compile(
-    r"(?:draft|write|prepare|compose) (?:an |a )?email\s+"
-    r"(?:about|regarding|for|re:?)\s+(.+)",
-    re.IGNORECASE,
+_EMAIL_SEND_TRIGGER = re.compile(
+    r"\b(?:send|fire off)\b\s+(?:an |a )?email\b\s*(.*)", re.IGNORECASE
 )
 
 _CANCEL_PATTERN = re.compile(r"^\s*(cancel|never\s*mind|forget it|nvm)\s*[.!]?\s*$", re.IGNORECASE)
@@ -191,12 +264,12 @@ _CANCEL_PATTERN = re.compile(r"^\s*(cancel|never\s*mind|forget it|nvm)\s*[.!]?\s
 def _looks_like_new_intent(text: str) -> bool:
     """Cheap check for whether a message clearly starts a different,
     fully-formed request, used to decide whether to abandon a pending
-    calendar task rather than treat this message as continuing it."""
+    calendar/email task rather than treat this message as continuing it."""
     if any(p.search(text) for p in _TODO_PATTERNS):
         return True
     if any(p.search(text) for p in _REMEMBER_PATTERNS):
         return True
-    if _EMAIL_PATTERN_WITH_RECIPIENT.search(text) or _EMAIL_PATTERN_NO_RECIPIENT.search(text):
+    if _EMAIL_DRAFT_TRIGGER.search(text) or _EMAIL_SEND_TRIGGER.search(text):
         return True
     if _CALENDAR_TRIGGER.search(text):
         return True
@@ -226,6 +299,31 @@ def _continue_pending_calendar(text: str, pending: dict) -> tuple[str, dict | No
     return f'Got it. What date and time should I put for "{title}"?', pending
 
 
+def _continue_pending_email(text: str, pending: dict, llm=None) -> tuple[str, dict | None]:
+    if _CANCEL_PATTERN.match(text):
+        return "No problem, I've dropped that email request.", None
+
+    # A continuation message is usually just the topic on its own ("inviting
+    # him to the design meeting today"), but might still name a recipient we
+    # don't have yet ("it's for inimfon, about the design meeting") -- try
+    # the same recipient/topic parser before falling back to treating the
+    # whole message as the topic.
+    recipient, topic = _parse_email_request(text)
+    if not topic:
+        topic = _EMAIL_LEADING_CONNECTORS.sub("", text.strip(" ,."), count=1).strip(" ,.")
+
+    if recipient and not pending.get("recipient"):
+        pending["recipient"] = recipient
+    if topic:
+        pending["topic"] = topic
+
+    if pending.get("topic"):
+        return _run_email_tool(pending["mode"], pending.get("recipient", ""), pending["topic"], llm=llm), None
+
+    who_display = pending.get("recipient") or "them"
+    return f"Got it. What should the email to {who_display} be about?", pending
+
+
 def route_task(
     user_input: str, llm=None, pending_task: dict | None = None
 ) -> tuple[str | None, dict | None]:
@@ -236,20 +334,23 @@ def route_task(
       asked, or None if this message isn't a task at all (caller should
       fall through to the RAG chain).
     - updated_pending_task is a dict to store in session state and pass
-      back in on the next call if a calendar request is still waiting on
-      more info, or None if there's nothing pending anymore.
+      back in on the next call if a calendar/email request is still
+      waiting on more info, or None if there's nothing pending anymore.
 
-    `llm` is optional and only used by draft_email to write a real body
-    instead of a bare template; every other tool ignores it.
+    `llm` is optional and used by draft_email/send_email to write a real
+    body instead of a bare template; every other tool ignores it.
     """
 
     text = user_input.strip()
 
-    # --- Continue an in-progress calendar request, if one exists and this
-    # message doesn't clearly start something else entirely. ---
-    if pending_task is not None and pending_task.get("intent") == "calendar":
-        if not _looks_like_new_intent(text):
+    # --- Continue an in-progress calendar/email request, if one exists and
+    # this message doesn't clearly start something else entirely. ---
+    if pending_task is not None:
+        intent = pending_task.get("intent")
+        if intent == "calendar" and not _looks_like_new_intent(text):
             return _continue_pending_calendar(text, pending_task)
+        if intent == "email" and not _looks_like_new_intent(text):
+            return _continue_pending_email(text, pending_task, llm=llm)
         # else: message looks like a fresh, complete request of its own --
         # fall through and abandon the pending one.
 
@@ -294,19 +395,24 @@ def route_task(
         title = _compute_calendar_title(slots)
         return f'I can set that up. What date and time should I put for "{title}"?', slots
 
-    # --- Email ---
-    match = _EMAIL_PATTERN_WITH_RECIPIENT.search(text)
+    # --- Email: send (real send attempt, falls back to draft-only) ---
+    match = _EMAIL_SEND_TRIGGER.search(text)
     if match:
-        recipient, key_points = match.group(1).strip(), match.group(2).strip()
-        subject = key_points if len(key_points) < 60 else key_points[:57] + "..."
-        return draft_email(recipient=recipient, subject=subject, key_points=key_points, llm=llm), None
+        recipient, topic = _parse_email_request(match.group(1))
+        if not topic:
+            pending = {"intent": "email", "mode": "send", "recipient": recipient}
+            who_display = recipient or "them"
+            return f"Sure -- what should the email to {who_display} be about?", pending
+        return _run_email_tool("send", recipient, topic, llm=llm), None
 
-    match = _EMAIL_PATTERN_NO_RECIPIENT.search(text)
+    # --- Email: draft only (never sent) ---
+    match = _EMAIL_DRAFT_TRIGGER.search(text)
     if match:
-        key_points = match.group(1).strip()
-        subject = key_points if len(key_points) < 60 else key_points[:57] + "..."
-        result = draft_email(recipient="[recipient]", subject=subject, key_points=key_points, llm=llm)
-        result += "\n\n_(No recipient was specified, so I used a placeholder -- let me know who this should go to and I'll redo it.)_"
-        return result, None
+        recipient, topic = _parse_email_request(match.group(1))
+        if not topic:
+            pending = {"intent": "email", "mode": "draft", "recipient": recipient}
+            who_display = recipient or "them"
+            return f"Sure -- what should the email to {who_display} be about?", pending
+        return _run_email_tool("draft", recipient, topic, llm=llm), None
 
     return None, None

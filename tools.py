@@ -23,6 +23,8 @@ import sqlite3
 import uuid
 from datetime import datetime
 
+from email_integration import try_send_email
+
 DB_PATH = "workbot_data.db"
 CALENDAR_PATH = "workbot_calendar.ics"
 DRAFTS_DIR = "email_drafts"
@@ -131,15 +133,10 @@ def _draft_body_with_llm(llm, recipient: str, subject: str, key_points: str) -> 
         return None
 
 
-def draft_email(recipient: str, subject: str, key_points: str, llm=None) -> str:
-    """Draft an email (not sent) and save it locally as a .txt file.
-
-    If `llm` is provided, ask it to write the body from key_points; if that
-    fails for any reason (or llm is None), fall back to a simple bulleted
-    template so this never breaks the demo.
-    """
-    os.makedirs(DRAFTS_DIR, exist_ok=True)
-
+def _compose_email(recipient: str, subject: str, key_points: str, llm=None) -> tuple[str, str, str]:
+    """Shared composition logic for both drafting and sending: builds a
+    subject, a body (LLM-written if possible, template otherwise), and the
+    full plain-text draft. Returns (subject, body, full_draft_text)."""
     subject = _clean_subject(subject)
 
     body = _draft_body_with_llm(llm, recipient, subject, key_points)
@@ -155,11 +152,49 @@ def draft_email(recipient: str, subject: str, key_points: str, llm=None) -> str:
         f"Best,\n"
         f"[Your name]\n"
     )
+    return subject, body, draft
 
+
+def _save_draft_file(recipient: str, draft: str) -> str:
+    os.makedirs(DRAFTS_DIR, exist_ok=True)
     filename = os.path.join(
         DRAFTS_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{recipient.strip().split()[0] if recipient.strip() else 'draft'}.txt"
     )
     with open(filename, "w") as f:
         f.write(draft)
+    return filename
 
+
+def draft_email(recipient: str, subject: str, key_points: str, llm=None) -> str:
+    """Draft an email (not sent) and save it locally as a .txt file.
+
+    If `llm` is provided, ask it to write the body from key_points; if that
+    fails for any reason (or llm is None), fall back to a simple bulleted
+    template so this never breaks the demo.
+    """
+    _, _, draft = _compose_email(recipient, subject, key_points, llm=llm)
+    filename = _save_draft_file(recipient, draft)
     return f"Drafted an email to **{recipient.strip()}** (saved to `{filename}`):\n\n```\n{draft}\n```"
+
+
+def send_email(recipient: str, subject: str, key_points: str, llm=None) -> str:
+    """Actually send an email via email_integration.try_send_email, with a
+    local .txt draft always saved alongside it as a fallback/audit trail.
+
+    Demo safety: the real send never goes to `recipient` -- see
+    email_integration.py for why. If sending isn't configured (no Gmail
+    App Password set up) or the send fails for any reason, this falls back
+    to draft-only behavior instead of breaking the conversation.
+    """
+    subject, body, draft = _compose_email(recipient, subject, key_points, llm=llm)
+    filename = _save_draft_file(recipient, draft)
+
+    sent_confirmation = try_send_email(parsed_recipient=recipient, subject=subject, body=draft)
+    if sent_confirmation is not None:
+        return f"{sent_confirmation}\n\n(Also saved a local copy to `{filename}`.)"
+
+    return (
+        f"Email sending isn't set up yet, so I saved this as a draft instead "
+        f"(`{filename}`) rather than losing it:\n\n```\n{draft}\n```\n\n"
+        f"_(See the README's email setup step to enable real sending.)_"
+    )

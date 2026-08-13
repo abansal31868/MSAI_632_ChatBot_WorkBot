@@ -9,9 +9,7 @@ An enterprise workplace productivity assistant built with **LangChain**, **Huggi
 1. **Ingestion (`ingest.py`)**: Fetches documents from a Google Drive folder, splits them into semantic chunks, generates embeddings using `sentence-transformers/all-MiniLM-L6-v2`, and builds a local FAISS vector store.
 2. **Real-time Synchronization (`webhook_server.py` & `register_webhook.py`)**: Subscribes to Google Drive push notifications to automatically update the vector index whenever documents are added or updated.
 3. **Chat Interface (`app.py`)**: Streamlit web interface powered by Hugging Face Inference API (`meta-llama/Llama-3.1-8B-Instruct`, via `ChatHuggingFace`) for answering workplace queries.
-4. **Personalization (`personalization.py`)**: A sidebar form (name, department, preferred answer style) saved locally in SQLite and folded into the system prompt on every turn -- no extra model calls.
-5. **Memory Management (`memory.py`)**: Short-term memory replays the last few turns into the model's context via a `chat_history` placeholder; long-term memory persists facts across sessions when the user explicitly says "remember that ...".
-6. **Multilingual Support (`i18n.py`)**: Detects the incoming message's language (`langdetect`) and translates to/from English (`deep-translator`, via Google Translate's free endpoint) around the English-only RAG/router core.
+4. **Task Automation / API & Tool Integration (`router.py`, `tools.py`, `calendar_integration.py`, `email_integration.py`)**: A deterministic keyword/regex router checks each message for a to-do, calendar, or email request *before* it reaches the RAG chain, so these actions cost zero extra model calls and work even if the Hugging Face model/provider is unavailable. To-dos are logged to a local SQLite table. Calendar events are created on the user's real Google Calendar via OAuth when configured, falling back to a local `.ics` file otherwise. Email has two distinct intents: "draft an email..." always just saves an LLM-written draft locally and never sends anything, while "send an email..." attempts a real send via Gmail SMTP — but for demo safety, a real send is always routed to one fixed, pre-configured address rather than whatever recipient was parsed from the message (the parsed recipient is still shown inside the email so the extraction is visible), and it falls back to a local draft if sending isn't configured. See the "Why deterministic, not LLM tool-calling" note in `router.py` and `test_tool_calling.py` for the reliability testing behind this design choice.
 
 ---
 
@@ -31,6 +29,23 @@ An enterprise workplace productivity assistant built with **LangChain**, **Huggi
 ├── faiss_workplace_index/  # Generated local FAISS vector index database
 ├── workbot_data.db         # Local SQLite store (to-dos, long-term facts, profile)
 └── requirements.txt         # Project dependencies
+├── app.py                    # Streamlit chat interface frontend
+├── ingest.py                 # Google Drive ingestion & vector store builder
+├── webhook_server.py         # FastAPI server to listen for Drive update events
+├── register_webhook.py       # Script to register webhook channel with Google Drive
+├── router.py                 # Deterministic intent router for Task Automation
+├── tools.py                  # To-do / calendar (local) / email-draft tool functions
+├── calendar_integration.py   # Real Google Calendar (OAuth) integration, with local fallback
+├── email_integration.py      # Real email sending (Gmail SMTP), always routed to a fixed demo address
+├── test_tool_calling.py      # Standalone LLM tool-calling reliability check (not part of the app)
+├── credentials.json          # Google Cloud Service Account credentials (DO NOT COMMIT)
+├── oauth_credentials.json    # Google OAuth Desktop client for Calendar (DO NOT COMMIT)
+├── calendar_token.json       # Cached OAuth token, created after first Calendar auth (DO NOT COMMIT)
+├── faiss_workplace_index/    # Generated local FAISS vector index database
+├── workbot_data.db           # Local SQLite store for to-dos
+├── workbot_calendar.ics      # Local calendar fallback file
+├── email_drafts/             # Saved (unsent) email drafts
+└── requirements.txt          # Project dependencies
 
 🛠️ Prerequisites & Setup
 1. Requirements
@@ -80,6 +95,30 @@ Step 4: Ensure the Google Drive API is Enabled
 - Open the Google Cloud Console API Library.
 - Ensure your project (project-msai-rag-drive-reader or equivalent) is selected at the top.
 - Search for Google Drive API and click Enable.
+
+Step 5: Set Up Google Calendar Integration (optional, for real calendar events)
+Calendar events default to a local `.ics` file. To have WorkBot create real events on your own Google Calendar instead:
+- In the same Cloud project, open the API Library, search for Google Calendar API, and click Enable.
+- Go to APIs & Services → Credentials → Create Credentials → OAuth client ID. Choose application type "Desktop app." Download the resulting JSON and save it in the repo root as `oauth_credentials.json` (this is separate from `credentials.json`, which is the service account used for Drive).
+- Go to APIs & Services → OAuth consent screen and add your own Google account under "Test users" (the app is unverified, so only test users can complete the consent flow).
+- The first time a calendar request runs, a browser window will open asking you to log in and approve calendar access. After that, a `calendar_token.json` is cached locally and you won't be prompted again.
+- If any of this isn't set up, or the request fails for any reason, WorkBot automatically falls back to writing the event to the local `workbot_calendar.ics` file instead — this integration is additive, not required.
+
+Step 6: Set Up Real Email Sending (optional, for real "send an email" requests)
+"Draft an email..." always just saves a local `.txt` file and never sends anything — no setup needed for that. "Send an email..." is a separate, real send via Gmail SMTP, and needs its own setup:
+- On the sending Gmail account, turn on 2-Step Verification (required for App Passwords): [myaccount.google.com/security](https://myaccount.google.com/security).
+- Generate an App Password at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) — pick any name (e.g. "WorkBot"), and copy the 16-character password it gives you.
+- Set these as environment variables before running the app:
+```bash
+export GMAIL_SENDER_ADDRESS="your_gmail_address@gmail.com"
+export GMAIL_APP_PASSWORD="the_16_char_app_password"
+# Optional: send demo emails somewhere other than your own inbox
+export WORKBOT_DEMO_RECIPIENT="your_gmail_address@gmail.com"
+```
+- **Demo safety, by design:** whatever recipient the router parses out of a message (e.g. "send an email to John about...") is never used as the real `To:` address. Every real send goes to `WORKBOT_DEMO_RECIPIENT` (or `GMAIL_SENDER_ADDRESS` if that's not set) instead — the parsed recipient is preserved inside the email body so the extraction is still visible. This means a live demo can't accidentally mail a real third party, no matter what gets typed or misparsed.
+- No Google Cloud Console project or OAuth client is needed for this — it's a separate, simpler auth path from the Calendar integration above.
+- If the environment variables aren't set, or the send fails for any reason, WorkBot automatically falls back to saving a local draft instead — this integration is additive, not required.
+
 🚀 How to Run
 1. Run Initial Ingestion
 To build the initial FAISS index from your Google Drive folder, configure FOLDER_ID in ingest.py and run:
@@ -139,8 +178,13 @@ curl "https://huggingface.co/api/models/<repo_id>?expand[]=inferenceProviderMapp
 ```
 `meta-llama/Llama-3.2-3B-Instruct`, for example, is only mapped to one provider (Featherless AI), which is why the app defaults to `meta-llama/Llama-3.1-8B-Instruct` instead — it's live across four providers, so it's far less likely to hit this error.
 
+**"Send an email..." always falls back to a local draft instead of actually sending**
+This means `email_integration.try_send_email` returned `None`, which happens if `GMAIL_SENDER_ADDRESS`/`GMAIL_APP_PASSWORD` aren't set, or the SMTP login/send itself failed (e.g. a regular Gmail password instead of an App Password, 2-Step Verification not enabled, or a typo in the app password). Nothing crashes — it's designed to degrade to draft-only — but if you expected a real send, double check Configuration Step 6 and that you're using the 16-character App Password, not your normal Gmail login password.
+
 🔒 Security Best Practices
-.gitignore Note: Ensure credentials.json and .env are added to your .gitignore file to prevent leaking secrets to GitHub.
+.gitignore Note: Ensure credentials.json, oauth_credentials.json, calendar_token.json, and .env are added to your .gitignore file to prevent leaking secrets to GitHub. workbot_data.db, workbot_calendar.ics, and email_drafts/ contain locally-generated demo data and should probably be gitignored too, rather than committed. GMAIL_APP_PASSWORD is an environment variable, not a file, so there's nothing to gitignore for it — but treat it like any other secret: don't paste it into code, commit messages, or shared scripts, and revoke it from [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) if it's ever exposed.
+
+Email Send Safety: `email_integration.py` always routes real sends to a fixed `WORKBOT_DEMO_RECIPIENT`/`GMAIL_SENDER_ADDRESS` address regardless of the parsed recipient (see Configuration Step 6). Don't remove that override to make "true" arbitrary-recipient sending work without adding a confirmation step first — the whole point is that a live demo can't accidentally email a real third party.
 
 Access Control: For sensitive workplace folders (e.g., HR or Payroll), maintain separate vector database indexes or apply role-based permission checks.
 
