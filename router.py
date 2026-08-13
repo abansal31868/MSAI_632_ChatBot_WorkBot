@@ -100,13 +100,30 @@ def _extract_datetime_phrase(text: str) -> str:
     return result.strip()
 
 
+# Both "who" and "topic" extraction stop at the same set of connector
+# words/punctuation rather than capturing greedily to the end of the
+# string -- an unbounded ".+" here means anything trailing the "with"
+# clause (a topic phrase, "on my calendar", a whole second sentence like
+# "Meeting is on August 12...") gets swallowed into the title. E.g. "Add a
+# meeting invite with Tim from marketing on my calendar to discuss a
+# marketing strategy for a new idea" used to produce who="Tim from
+# marketing on my calendar to discuss a marketing strategy for a new
+# idea" instead of stopping at "to discuss".
+_WHO_STOP = r"(?=\s+\b(?:about|regarding|concerning|to\s+discuss|to\s+talk\s+about)\b|[.,!?]|$)"
+_TOPIC_STOP = r"(?=\s+\bwith\b|[.!?]|$)"
+
+
 def _extract_who(text: str) -> str:
     """Pull out who a meeting is with/attendees are, e.g. 'a call with
-    Sarah' -> 'Sarah', or 'the attendees are Alpna and Tim' -> 'Alpna and Tim'."""
-    match = re.search(r"\bwith\s+(.+)", text, re.IGNORECASE)
+    Sarah' -> 'Sarah', or 'the attendees are Alpna and Tim' -> 'Alpna and Tim'.
+    Stops at a topic connector, punctuation, or end of string rather than
+    swallowing everything that follows."""
+    match = re.search(r"\bwith\s+(.+?)" + _WHO_STOP, text, re.IGNORECASE)
     if not match:
         match = re.search(
-            r"\battendees?(?:\s+(?:are|is|include))?\s*:?\s*(.+)", text, re.IGNORECASE
+            r"\battendees?(?:\s+(?:are|is|include))?\s*:?\s*(.+?)" + _WHO_STOP,
+            text,
+            re.IGNORECASE,
         )
     if not match:
         return ""
@@ -117,11 +134,26 @@ def _extract_who(text: str) -> str:
 
 def _extract_topic(text: str) -> str:
     """Pull out what a meeting is about, e.g. 'it's about budget planning'
-    -> 'budget planning'."""
-    match = re.search(r"\b(?:it'?s|it is|its)?\s*about\s+(.+)", text, re.IGNORECASE)
+    -> 'budget planning', or 'to discuss the roadmap' -> 'the roadmap'.
+    Stops at a "with" clause, punctuation, or end of string.
+
+    Same trailing-preposition trim as _extract_who: when the date phrase
+    gets sliced out of the remainder upstream (e.g. "about the roadmap on
+    August 20 at 9am" -> "about the roadmap on" once "August 20 at 9am" is
+    removed), a bare trailing "on"/"at"/"for" is left dangling with no
+    punctuation before it for the stop-lookahead to catch.
+    """
+    match = re.search(
+        r"\b(?:it'?s|it is|its)?\s*(?:about|regarding|concerning|to\s+discuss|"
+        r"to\s+talk\s+about)\s+(.+?)" + _TOPIC_STOP,
+        text,
+        re.IGNORECASE,
+    )
     if not match:
         return ""
-    return match.group(1).strip(" ,.")
+    topic = match.group(1).strip(" ,.")
+    topic = re.sub(r"\s+(?:for|at|on)\s*$", "", topic, flags=re.IGNORECASE).strip(" ,.")
+    return topic
 
 
 def _compute_calendar_title(slots: dict) -> str:
@@ -145,14 +177,19 @@ def _finalize_calendar_event(slots: dict) -> str:
 
 
 # A recipient phrase runs from "to" up to whichever comes first: a known
-# topic-introducing word/phrase, or the end of the string. This deliberately
-# does NOT require "about"/"regarding" to immediately follow -- earlier
-# versions did, which meant natural phrasings like "send an email to
-# inimfon inviting him to the design meeting today" (no "about" at all)
-# silently failed to match anything and fell through to the RAG chain.
+# topic-introducing word/phrase, sentence-ending punctuation, or the end of
+# the string. This deliberately does NOT require "about"/"regarding" to
+# immediately follow -- earlier versions did, which meant natural phrasings
+# like "send an email to inimfon inviting him to the design meeting today"
+# (no "about" at all) silently failed to match anything and fell through to
+# the RAG chain. "that" is also a stop word (not just the verb-attached
+# "letting her know that") for phrasing like "to John that I've completed
+# my onboarding". Punctuation is a hard stop too -- a recipient name never
+# legitimately spans a period, so "to Sandra. Subject line is ..." stops at
+# "Sandra" instead of swallowing the whole rest of the sentence.
 _EMAIL_RECIPIENT_PATTERN = re.compile(
-    r"\bto\s+(.+?)(?=\s+\b(?:about|regarding|concerning|on|re:?|for|"
-    r"inviting|telling|informing|asking|letting|updating|reminding)\b|$)",
+    r"\bto\s+(.+?)(?=\s+\b(?:about|regarding|concerning|on|re:?|for|that|"
+    r"inviting|telling|informing|asking|letting|updating|reminding)\b|[.!?]|$)",
     re.IGNORECASE,
 )
 
@@ -161,7 +198,7 @@ _EMAIL_RECIPIENT_PATTERN = re.compile(
 # ("about", "inviting him to", "letting her know that", ...) that reads
 # awkwardly if left in a subject line or email body, so strip it off.
 _EMAIL_LEADING_CONNECTORS = re.compile(
-    r"^(?:about|regarding|concerning|on|re:?|for|"
+    r"^(?:about|regarding|concerning|on|re:?|for|that|"
     r"inviting\s+(?:him|her|them|us)?\s*(?:to)?|"
     r"telling\s+(?:him|her|them|us)?\s*(?:that|about)?|"
     r"informing\s+(?:him|her|them|us)?\s*(?:that|about)?|"
@@ -170,6 +207,46 @@ _EMAIL_LEADING_CONNECTORS = re.compile(
     r"updating\s+(?:him|her|them|us)?\s*(?:on|about)?|"
     r"reminding\s+(?:him|her|them|us)?\s*(?:to|about)?"
     r")\s+",
+    re.IGNORECASE,
+)
+
+# Explicit dictation support: some people just state the subject and body
+# outright ("Subject line is 'Project planning' and the body should ask
+# 'when can we meet'") instead of a loose "about X" phrase. When present,
+# these take priority over the generic topic extraction above, which would
+# otherwise dump the whole dictated sentence into a mangled subject line.
+_EMAIL_SUBJECT_QUOTED = re.compile(
+    r'\bsubject(?:\s+line)?\s*(?:is|:)\s*"([^"]+)"', re.IGNORECASE
+)
+_EMAIL_SUBJECT_UNQUOTED = re.compile(
+    r"\bsubject(?:\s+line)?\s*(?:is|:)\s*([^,.]+)", re.IGNORECASE
+)
+_EMAIL_BODY_INSTRUCTION = re.compile(
+    r"\b(?:the\s+)?body\s+(?:should|is to|will|needs to)\s+(.+)", re.IGNORECASE
+)
+
+
+def _extract_explicit_subject_and_body(text: str) -> tuple[str, str]:
+    """Pull an explicitly-dictated subject and/or body instruction out of
+    text, e.g. 'Subject line is "Project planning" and the body should ask
+    "when can we meet"' -> ('Project planning', 'ask "when can we meet"').
+    Either can come back empty if not present."""
+    subject_match = _EMAIL_SUBJECT_QUOTED.search(text) or _EMAIL_SUBJECT_UNQUOTED.search(text)
+    subject = subject_match.group(1).strip(" ,.\"'") if subject_match else ""
+
+    body_match = _EMAIL_BODY_INSTRUCTION.search(text)
+    body_instruction = body_match.group(1).strip(" ,.\"'") if body_match else ""
+
+    return subject, body_instruction
+
+
+# Lets a user correct a wrongly-parsed recipient mid-conversation ("no, the
+# recipient is Sandra") instead of only being able to cancel and start
+# over. Deliberately checked before the generic continuation parsing in
+# _continue_pending_email, and overwrites pending["recipient"] even if one
+# was already set (bad or otherwise) -- a correction should always win.
+_RECIPIENT_CORRECTION_PATTERN = re.compile(
+    r"(?:no,?\s*)?(?:the\s+)?recipient\s+(?:is|should be|was supposed to be)\s+(?:just\s+)?(.+)",
     re.IGNORECASE,
 )
 
@@ -192,9 +269,16 @@ def _parse_email_request(remainder: str) -> tuple[str, str]:
     return recipient, topic
 
 
-def _run_email_tool(mode: str, recipient: str, topic: str, llm=None) -> str:
+def _run_email_tool(
+    mode: str, recipient: str, topic: str, llm=None, explicit_subject: str = ""
+) -> str:
+    """`explicit_subject` overrides the truncated-topic subject line when
+    the user dictated one outright ("Subject line is ...") -- `topic` is
+    still what gets passed as key_points to drive the body, since that's
+    the actual content instruction even when a cleaner subject was given
+    separately."""
     recipient_final = recipient or "[recipient]"
-    subject = topic if len(topic) < 60 else topic[:57] + "..."
+    subject = explicit_subject or (topic if len(topic) < 60 else topic[:57] + "...")
     tool = send_email if mode == "send" else draft_email
     result = tool(recipient=recipient_final, subject=subject, key_points=topic, llm=llm)
     if not recipient:
@@ -303,22 +387,58 @@ def _continue_pending_email(text: str, pending: dict, llm=None) -> tuple[str, di
     if _CANCEL_PATTERN.match(text):
         return "No problem, I've dropped that email request.", None
 
+    # A recipient correction ("no, the recipient is Sandra") always wins,
+    # even overwriting an already-set (possibly wrong) recipient -- checked
+    # first so it can't be shadowed by the generic parsing below, which
+    # would otherwise just treat "the recipient is Sandra" as more topic
+    # text and never actually fix anything.
+    correction = _RECIPIENT_CORRECTION_PATTERN.search(text)
+    if correction:
+        pending["recipient"] = correction.group(1).strip(" ,.\"'")
+        if pending.get("topic") or pending.get("explicit_subject"):
+            return (
+                _run_email_tool(
+                    pending["mode"],
+                    pending["recipient"],
+                    pending.get("topic", ""),
+                    llm=llm,
+                    explicit_subject=pending.get("explicit_subject", ""),
+                ),
+                None,
+            )
+        return f"Got it -- what should the email to {pending['recipient']} be about?", pending
+
     # A continuation message is usually just the topic on its own ("inviting
     # him to the design meeting today"), but might still name a recipient we
     # don't have yet ("it's for inimfon, about the design meeting") -- try
     # the same recipient/topic parser before falling back to treating the
-    # whole message as the topic.
+    # whole message as the topic. Also check for an explicitly dictated
+    # subject/body, which takes priority over the generic topic text.
     recipient, topic = _parse_email_request(text)
-    if not topic:
+    explicit_subject, body_instruction = _extract_explicit_subject_and_body(text)
+    if body_instruction:
+        topic = body_instruction
+    elif not topic:
         topic = _EMAIL_LEADING_CONNECTORS.sub("", text.strip(" ,."), count=1).strip(" ,.")
 
     if recipient and not pending.get("recipient"):
         pending["recipient"] = recipient
     if topic:
         pending["topic"] = topic
+    if explicit_subject:
+        pending["explicit_subject"] = explicit_subject
 
-    if pending.get("topic"):
-        return _run_email_tool(pending["mode"], pending.get("recipient", ""), pending["topic"], llm=llm), None
+    if pending.get("topic") or pending.get("explicit_subject"):
+        return (
+            _run_email_tool(
+                pending["mode"],
+                pending.get("recipient", ""),
+                pending.get("topic", ""),
+                llm=llm,
+                explicit_subject=pending.get("explicit_subject", ""),
+            ),
+            None,
+        )
 
     who_display = pending.get("recipient") or "them"
     return f"Got it. What should the email to {who_display} be about?", pending
@@ -382,6 +502,14 @@ def route_task(
         # not from raw directly -- otherwise "with the design team for next
         # Monday at 10am" swallows the date into the "who" text.
         remainder = raw.replace(when, "", 1).strip(" ,.") if when else raw
+        # "on my/the/our calendar" is filler that shows up naturally in
+        # phrasing like "add a meeting with Tim on my calendar to discuss
+        # X" -- it's not part of who or topic, so drop it before extracting
+        # either (otherwise it either gets swallowed into "who" or sits
+        # between "who" and the topic connector and blocks the match).
+        remainder = re.sub(
+            r"\bon\s+(?:my|the|our)\s+calendar\b", "", remainder, flags=re.IGNORECASE
+        ).strip(" ,.")
         slots = {
             "intent": "calendar",
             "when": when,
@@ -398,21 +526,29 @@ def route_task(
     # --- Email: send (real send attempt, falls back to draft-only) ---
     match = _EMAIL_SEND_TRIGGER.search(text)
     if match:
-        recipient, topic = _parse_email_request(match.group(1))
-        if not topic:
+        remainder = match.group(1)
+        recipient, topic = _parse_email_request(remainder)
+        explicit_subject, body_instruction = _extract_explicit_subject_and_body(remainder)
+        if body_instruction:
+            topic = body_instruction
+        if not topic and not explicit_subject:
             pending = {"intent": "email", "mode": "send", "recipient": recipient}
             who_display = recipient or "them"
             return f"Sure -- what should the email to {who_display} be about?", pending
-        return _run_email_tool("send", recipient, topic, llm=llm), None
+        return _run_email_tool("send", recipient, topic, llm=llm, explicit_subject=explicit_subject), None
 
     # --- Email: draft only (never sent) ---
     match = _EMAIL_DRAFT_TRIGGER.search(text)
     if match:
-        recipient, topic = _parse_email_request(match.group(1))
-        if not topic:
+        remainder = match.group(1)
+        recipient, topic = _parse_email_request(remainder)
+        explicit_subject, body_instruction = _extract_explicit_subject_and_body(remainder)
+        if body_instruction:
+            topic = body_instruction
+        if not topic and not explicit_subject:
             pending = {"intent": "email", "mode": "draft", "recipient": recipient}
             who_display = recipient or "them"
             return f"Sure -- what should the email to {who_display} be about?", pending
-        return _run_email_tool("draft", recipient, topic, llm=llm), None
+        return _run_email_tool("draft", recipient, topic, llm=llm, explicit_subject=explicit_subject), None
 
     return None, None

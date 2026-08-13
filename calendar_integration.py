@@ -17,8 +17,11 @@ First call opens a browser for one-time consent; after that a cached
 token.json is reused automatically.
 """
 
+import logging
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
+
+_logger = logging.getLogger(__name__)
 
 try:
     import dateparser
@@ -50,6 +53,7 @@ def _get_calendar_credentials():
         try:
             creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
         except Exception:
+            _logger.exception("Failed to load cached Calendar credentials from %s", TOKEN_PATH)
             creds = None
 
     if not creds or not creds.valid:
@@ -64,6 +68,7 @@ def _get_calendar_credentials():
             with open(TOKEN_PATH, "w") as token_file:
                 token_file.write(creds.to_json())
         except Exception:
+            _logger.exception("Failed to obtain/refresh Calendar credentials")
             return None
 
     return creds
@@ -90,6 +95,18 @@ def try_create_google_calendar_event(title: str, when_text: str) -> str | None:
     if start_dt is None:
         return None
 
+    # dateparser returns a naive datetime (no UTC offset attached) for a
+    # phrase like "August 12 at 2pm" -- there's no timezone info in the
+    # text to parse. The Calendar API rejects a dateTime with no offset
+    # and no explicit timeZone field ("Missing time zone definition for
+    # start time."), so attach the machine's local timezone before this
+    # goes anywhere near isoformat(). Since when_text is always meant in
+    # whatever timezone the person typing it is in, the local system
+    # timezone is the right interpretation here.
+    if start_dt.tzinfo is None:
+        local_tz = datetime.now().astimezone().tzinfo
+        start_dt = start_dt.replace(tzinfo=local_tz)
+
     end_dt = start_dt + timedelta(minutes=DEFAULT_EVENT_DURATION_MINUTES)
 
     creds = _get_calendar_credentials()
@@ -107,10 +124,19 @@ def try_create_google_calendar_event(title: str, when_text: str) -> str | None:
             service.events().insert(calendarId="primary", body=event_body).execute()
         )
     except Exception:
+        _logger.exception("Google Calendar event creation failed, falling back to local .ics")
         return None
 
     link = created_event.get("htmlLink", "")
-    when_display = start_dt.strftime("%A, %B %d at %I:%M %p")
+    # Always include the year, even for near-term dates: a bare month/day
+    # phrase like "August 12" that's already passed this year gets rolled
+    # to next year by PREFER_DATES_FROM="future" above, which is the
+    # correct interpretation (you can't schedule a meeting in the past) --
+    # but omitting the year from the confirmation made that silent, so an
+    # event a full year out looked identical to one next week. Found via a
+    # real case: "Meeting on August 12" asked for on August 13 landed on
+    # August 12 *2027*, and nothing in the chat reply said so.
+    when_display = start_dt.strftime("%A, %B %d, %Y at %I:%M %p")
     if link:
         return (
             f"Created calendar event: **{title.strip()}** ({when_display}) "

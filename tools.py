@@ -24,6 +24,7 @@ import uuid
 from datetime import datetime
 
 from email_integration import try_send_email
+from personalization import get_profile
 
 DB_PATH = "workbot_data.db"
 CALENDAR_PATH = "workbot_calendar.ics"
@@ -144,13 +145,19 @@ def _compose_email(recipient: str, subject: str, key_points: str, llm=None) -> t
         body_lines = [p.strip() for p in re.split(r"[.;\n]", key_points) if p.strip()]
         body = "\n".join(f"- {line}" for line in body_lines) if body_lines else key_points.strip()
 
+    # Personalization (Feature #5, personalization.py) already has a "Your
+    # profile" sidebar form with a Name field -- reuse that here instead of
+    # a bare "[Your name]" placeholder, so setting your name once in the
+    # sidebar is enough for it to show up in every email sign-off too.
+    sign_off_name = get_profile().get("name") or "[Your name]"
+
     draft = (
         f"To: {recipient.strip()}\n"
         f"Subject: {subject}\n\n"
         f"Hi {recipient.strip().split()[0] if recipient.strip() else 'there'},\n\n"
         f"{body}\n\n"
         f"Best,\n"
-        f"[Your name]\n"
+        f"{sign_off_name}\n"
     )
     return subject, body, draft
 
