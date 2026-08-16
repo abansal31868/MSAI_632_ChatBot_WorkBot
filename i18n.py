@@ -32,8 +32,13 @@ quality for non-English conversations depends on the base model's
 multilingual ability rather than on this module.
 """
 
-from langdetect import detect, LangDetectException
+from langdetect import detect_langs, LangDetectException, DetectorFactory
 from deep_translator import GoogleTranslator
+
+# Without a fixed seed, langdetect's probabilities can vary slightly
+# between runs on the same input, which would make MIN_CONFIDENCE below
+# unreliable. Seeding makes detection deterministic.
+DetectorFactory.seed = 0
 
 # langdetect's ISO 639-1 code for English.
 ENGLISH = "en"
@@ -44,16 +49,33 @@ ENGLISH = "en"
 # wrong-language false positive that garbles a two-word reply.
 MIN_CHARS_FOR_DETECTION = 12
 
+# Even above the length threshold, langdetect can confidently misclassify
+# short or informal English (e.g. "How many PTO days do I get" was
+# misdetected as a different language entirely during testing, and its
+# answer got mistranslated into that wrong language). Requiring a high
+# confidence score before trusting a non-English result means an
+# ambiguous message defaults to English -- a safe failure mode -- instead
+# of risking a full round-trip mistranslation of a message that was
+# actually English all along.
+MIN_CONFIDENCE = 0.90
+
 
 def detect_language(text: str) -> str:
     """Best-effort language detection. Returns an ISO 639-1 code, or "en"
-    if detection wasn't attempted (short text) or failed outright."""
+    if detection wasn't attempted (short text), failed outright, or came
+    back below MIN_CONFIDENCE."""
     if len(text.strip()) < MIN_CHARS_FOR_DETECTION:
         return ENGLISH
     try:
-        return detect(text)
+        candidates = detect_langs(text)
     except LangDetectException:
         return ENGLISH
+    if not candidates:
+        return ENGLISH
+    top = candidates[0]
+    if top.lang == ENGLISH or top.prob < MIN_CONFIDENCE:
+        return ENGLISH
+    return top.lang
 
 
 def translate_to_english(text: str, source_lang: str) -> str:
